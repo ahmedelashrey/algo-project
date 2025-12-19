@@ -398,12 +398,14 @@ namespace MagniSnap
         private readonly ShortestPathFinder _pathFinder;
         private readonly List<Point> _anchorPoints;
         private readonly List<Point[]> _confirmedPaths;
+        private bool _isClosed;
 
         public MultiAnchorPathFinder()
         {
             _pathFinder = new ShortestPathFinder();
             _anchorPoints = new List<Point>();
             _confirmedPaths = new List<Point[]>();
+            _isClosed = false;
         }
 
         public void SetImage(RGBPixel[,] imageMatrix)
@@ -437,13 +439,16 @@ namespace MagniSnap
 
         public void CloseSelection()
         {
-            if (_anchorPoints.Count < 2)
+            if (_anchorPoints.Count < 2 || _isClosed)
                 return;
 
             Point first = _anchorPoints[0];
             List<Point> closingPath = _pathFinder.GetPathToAnchor(first.X, first.Y);
             if (closingPath.Count >= 2)
+            { 
                 _confirmedPaths.Add(closingPath.ToArray());
+                _isClosed = true;
+            }
         }
 
         public void Draw(Graphics g, int freeX, int freeY, Color pathColor, Color anchorColor)
@@ -481,5 +486,36 @@ namespace MagniSnap
 
         public int AnchorCount => _anchorPoints.Count;
         public bool HasAnchors => _anchorPoints.Count > 0;
+
+        public bool IsClosed => _isClosed;
+
+        public Point[] GetClosedPolygon()
+        {
+            if (!IsClosed)
+                return null;
+
+            List<Point> poly = new List<Point>(1024);
+
+            for (int i = 0; i < _confirmedPaths.Count; i++)
+            {
+                Point[] segment = _confirmedPaths[i];
+                if (segment == null || segment.Length == 0)
+                    continue;
+
+                if (poly.Count > 0 && poly[poly.Count - 1] == segment[0])
+                {
+                    // Skip the first point to avoid duplication
+                    for (int j = 1; j < segment.Length; j++)
+                        poly.Add(segment[j]);
+                }
+                else
+                {
+                    for (int j = 0; j < segment.Length; j++)
+                        poly.Add(segment[j]);
+                }
+            }
+
+            return poly.Count >= 3 ? poly.ToArray() : null;
+        }
     }
 }

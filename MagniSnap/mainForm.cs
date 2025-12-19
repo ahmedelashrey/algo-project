@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 
 namespace MagniSnap
@@ -10,7 +11,8 @@ namespace MagniSnap
     public partial class MainForm : Form
     {
         RGBPixel[,] ImageMatrix;
-        bool isLassoEnabled = false;
+        bool isLassoActive = false;   // tool accepts input & live paths
+        bool isLassoVisible = false; // selection is drawn
 
         // Shortest path finder for livewire
         MultiAnchorPathFinder pathFinder;
@@ -90,7 +92,8 @@ namespace MagniSnap
 
             mainPictureBox.Cursor = Cursors.Cross;
 
-            isLassoEnabled = true;
+            isLassoActive = true;
+            isLassoVisible = true;
         }
 
         private void btnLivewire_Leave(object sender, EventArgs e)
@@ -98,12 +101,13 @@ namespace MagniSnap
             menuButton_Leave(sender, e);
 
             mainPictureBox.Cursor = Cursors.Default;
-            isLassoEnabled = false;
+            isLassoActive = false;
+            isLassoVisible = false;
         }
 
         private void mainPictureBox_MouseClick(object sender, MouseEventArgs e)
         {
-            if (ImageMatrix == null || !isLassoEnabled)
+            if (ImageMatrix == null || !isLassoActive)
                 return;
 
             int width = ImageToolkit.GetWidth(ImageMatrix);
@@ -123,6 +127,11 @@ namespace MagniSnap
             {
                 // Close selection (connect last anchor to first)
                 pathFinder.CloseSelection();
+                // Exit lasso tool
+                // Stop live interaction but keep drawing
+                isLassoActive = false;
+                mainPictureBox.Cursor = Cursors.Default;
+
                 mainPictureBox.Refresh();
             }
         }
@@ -134,7 +143,7 @@ namespace MagniSnap
 
             currentMousePos = new Point(e.X, e.Y);
 
-            if (ImageMatrix != null && isLassoEnabled && pathFinder.HasAnchors)
+            if (ImageMatrix != null && isLassoActive && pathFinder.HasAnchors)
             {
                 // Refresh to redraw the live path
                 mainPictureBox.Invalidate();
@@ -150,7 +159,7 @@ namespace MagniSnap
 
         private void mainPictureBox_Paint(object sender, PaintEventArgs e)
         {
-            if (ImageMatrix == null || !isLassoEnabled || !pathFinder.HasAnchors)
+            if (ImageMatrix == null || !isLassoVisible || !pathFinder.HasAnchors)
                 return;
 
             // Draw all paths (confirmed + live)
@@ -160,7 +169,83 @@ namespace MagniSnap
 
         private void saveToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            
+            if (ImageMatrix == null)
+                return;
+
+            // Ensure selection is closed
+            if (!pathFinder.IsClosed)
+            {
+                MessageBox.Show("Please close the selection before saving.",
+                    "Incomplete Selection",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            Point[] polygon = pathFinder.GetClosedPolygon();
+            if (polygon == null || polygon.Length < 3)
+                return;
+
+            SaveFileDialog sfd = new SaveFileDialog
+            {
+                Filter = "PNG Image (*.png)|*.png",
+                DefaultExt = "png",
+                FileName = $"selection_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.png"
+            };
+
+            if (sfd.ShowDialog() != DialogResult.OK)
+                return;
+
+   
+
+            // Compute bounding box
+            Rectangle bounds = GetPolygonBounds(polygon);
+
+            Bitmap result = new Bitmap(bounds.Width, bounds.Height,
+                System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+
+            using (Graphics g = Graphics.FromImage(result))
+            using (GraphicsPath path = new GraphicsPath())
+            {
+                g.Clear(Color.Transparent);
+
+                // Shift polygon to local coordinates
+                Point[] shifted = new Point[polygon.Length];
+                for (int i = 0; i < polygon.Length; i++)
+                {
+                    shifted[i] = new Point(
+                        polygon[i].X - bounds.X,
+                        polygon[i].Y - bounds.Y);
+                }
+
+                path.AddPolygon(shifted);
+                g.SetClip(path);
+
+                // Draw cropped area
+                g.DrawImage(
+                    mainPictureBox.Image,
+                    new Rectangle(0, 0, bounds.Width, bounds.Height),
+                    bounds,
+                    GraphicsUnit.Pixel);
+            }
+
+            result.Save(sfd.FileName, System.Drawing.Imaging.ImageFormat.Png);
+        }
+
+        private static Rectangle GetPolygonBounds(Point[] pts)
+        {
+            int minX = int.MaxValue, minY = int.MaxValue;
+            int maxX = int.MinValue, maxY = int.MinValue;
+
+            foreach (Point p in pts)
+            {
+                if (p.X < minX) minX = p.X;
+                if (p.Y < minY) minY = p.Y;
+                if (p.X > maxX) maxX = p.X;
+                if (p.Y > maxY) maxY = p.Y;
+            }
+
+            return Rectangle.FromLTRB(minX, minY, maxX + 1, maxY + 1);
         }
     }
 }
