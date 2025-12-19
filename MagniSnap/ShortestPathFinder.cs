@@ -3,13 +3,11 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Runtime.CompilerServices;
-using System.Threading.Tasks;
 
 namespace MagniSnap
 {
     /// <summary>
     /// Fast min-heap for (nodeIndex, priority) pairs.
-    /// No structs/IComparable, no swaps: sift-up/down with "hole" technique.
     /// </summary>
     internal sealed class MinHeap
     {
@@ -17,7 +15,7 @@ namespace MagniSnap
         private double[] _prio;
         private int _count;
 
-        public MinHeap(int capacity = 1024)
+        public MinHeap(int capacity)
         {
             if (capacity < 1) capacity = 1;
             _node = new int[capacity];
@@ -25,10 +23,13 @@ namespace MagniSnap
             _count = 0;
         }
 
-        public int Count => _count;
+        public int Count { get { return _count; } }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void Clear() => _count = 0;
+        public void Clear()
+        {
+            _count = 0;
+        }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Insert(int nodeIndex, double priority)
@@ -113,63 +114,110 @@ namespace MagniSnap
     }
 
     /// <summary>
-    /// Finds shortest path using Dijkstra on a 4-connected pixel grid.
-    /// Major optimizations:
-    /// - Flattened 2D arrays into 1D for cache efficiency
-    /// - Removed GetEdgeWeight() swapping/branching from inner loop
-    /// - Reuse arrays between runs to avoid large allocations/GC pressure
-    /// - Fast heap + stale-entry skip (no visited[,] needed)
-    /// - DrawPath() backtracks and draws without allocating a List every mouse-move
+    /// Windowed shortest path finder.
+    /// Instead of running Dijkstra on the full image, it runs only on a fixed window (default 128x128).
+    /// The window is positioned around the current cursor (then shifted to keep the anchor inside).
+    /// If the target is far, it is clamped to the window edge; MultiAnchorPathFinder can "walk" in steps on click.
     /// </summary>
     public sealed class ShortestPathFinder
     {
+        private const bool LOG_TIMINGS = false;
+
         private RGBPixel[,] _imageMatrix;
         private int _height;
         private int _width;
         private int _n; // _height * _width
 
-        // Edge weights stored per pixel (flattened):
-        // weightRight[idx] = weight from (r,c) to (r,c+1)
-        // weightDown[idx]  = weight from (r,c) to (r+1,c)
+        // Full-image edge weights (precomputed once per image)
         private float[] _weightRight;
         private float[] _weightDown;
 
-        // Dijkstra results (flattened)
-        private double[] _distance;
-        private int[] _parentIdx; // previous node index, -1 if none
+        // Window params
+        private int _windowSize;       // e.g., 128
+        private int _halfWindow;       // windowSize/2
 
-        private int _anchorIdx = -1;
+        // Current window bounds (inclusive)
+        private int _winLeft;
+        private int _winTop;
+        private int _winRight;
+        private int _winBottom;
+        private int _winWidth;
+        private int _winHeight;
+        private int _winN;
+        private bool _winValid;
+
+        // Window Dijkstra buffers
+        private double[] _dist;
+        private int[] _parent; // parent local index, -1 if none
+        private MinHeap _pq;
+        private bool _dijkstraValid;
+
+        // Anchor (global)
+        private int _anchorX;
+        private int _anchorY;
+        private int _anchorIdxGlobal;
+        private int _anchorIdxLocal;
         private bool _hasAnchor;
 
-        public bool HasAnchor => _hasAnchor;
-        public Point AnchorPoint => _hasAnchor ? IdxToPoint(_anchorIdx) : new Point(-1, -1);
+        public bool HasAnchor { get { return _hasAnchor; } }
+
+        public Point AnchorPoint
+        {
+            get
+            {
+                if (!_hasAnchor) return new Point(-1, -1);
+                return new Point(_anchorX, _anchorY);
+            }
+        }
 
         public ShortestPathFinder()
+            : this(128)
         {
+        }
+
+        public ShortestPathFinder(int windowSize)
+        {
+            if (windowSize < 16) windowSize = 16;
+            _windowSize = windowSize;
+            _halfWindow = windowSize / 2;
+
             _hasAnchor = false;
+            _winValid = false;
+            _dijkstraValid = false;
+
+            _pq = new MinHeap(windowSize * windowSize);
         }
 
         public void SetImage(RGBPixel[,] imageMatrix)
         {
-            _imageMatrix = imageMatrix ?? throw new ArgumentNullException(nameof(imageMatrix));
+            if (imageMatrix == null) throw new ArgumentNullException("imageMatrix");
+
+            _imageMatrix = imageMatrix;
             _height = ImageToolkit.GetHeight(imageMatrix);
             _width = ImageToolkit.GetWidth(imageMatrix);
             _n = _height * _width;
 
-            EnsureWorkingBuffers(_n);
+            EnsureWeightBuffers(_n);
             BuildGraph(); // precompute edge weights once per image
 
-            _hasAnchor = false;
-            _anchorIdx = -1;
+            ClearAnchor();
         }
 
-        private void EnsureWorkingBuffers(int n)
+        public void ClearAnchor()
+        {
+            _hasAnchor = false;
+            _anchorX = _anchorY = -1;
+            _anchorIdxGlobal = -1;
+            _anchorIdxLocal = -1;
+
+            _winValid = false;
+            _dijkstraValid = false;
+        }
+
+        private void EnsureWeightBuffers(int n)
         {
             if (_weightRight == null || _weightRight.Length != n) _weightRight = new float[n];
             if (_weightDown == null || _weightDown.Length != n) _weightDown = new float[n];
-
-            if (_distance == null || _distance.Length != n) _distance = new double[n];
-            if (_parentIdx == null || _parentIdx.Length != n) _parentIdx = new int[n];
         }
 
         /// <summary>
@@ -180,9 +228,9 @@ namespace MagniSnap
         {
             const double epsilon = 0.0001;
 
-            Stopwatch sw = Stopwatch.StartNew();
+            Stopwatch sw = null;
+            if (LOG_TIMINGS) sw = Stopwatch.StartNew();
 
-         
             for (int row = 0; row < _height; row++)
             {
                 int baseIdx = row * _width;
@@ -195,11 +243,12 @@ namespace MagniSnap
                     _weightDown[idx] = (float)(1.0 / (energy.Y + epsilon));
                 }
             }
-            
 
-            sw.Stop();
-
-            Console.WriteLine($"Graph build: {sw.ElapsedMilliseconds} ms");
+            if (LOG_TIMINGS)
+            {
+                sw.Stop();
+                Console.WriteLine("Graph build: " + sw.ElapsedMilliseconds + " ms");
+            }
         }
 
         public void SetAnchorPoint(int x, int y)
@@ -209,200 +258,376 @@ namespace MagniSnap
             if ((uint)x >= (uint)_width || (uint)y >= (uint)_height)
                 throw new ArgumentOutOfRangeException("Anchor point out of bounds.");
 
-            _anchorIdx = y * _width + x;
+            _anchorX = x;
+            _anchorY = y;
+            _anchorIdxGlobal = y * _width + x;
             _hasAnchor = true;
 
-            RunDijkstra(_anchorIdx);
+            // Force recompute next time (window depends on cursor / target)
+            _winValid = false;
+            _dijkstraValid = false;
         }
 
         /// <summary>
-        /// Dijkstra from a single source over the whole grid.
-        /// Uses stale-entry skipping (distFromHeap > distance[u]) instead of visited[].
+        /// Ensures the window and Dijkstra tree are ready for a given target point.
+        /// Returns an "effective" target inside the current window (may be clamped to the window edge).
         /// </summary>
-        private void RunDijkstra(int srcIdx)
+        public Point PrepareForTarget(int targetX, int targetY)
         {
-            Stopwatch sw = Stopwatch.StartNew();
+            if (!_hasAnchor || _imageMatrix == null)
+                return new Point(targetX, targetY);
 
-            // Reset arrays (still O(n), but avoids reallocations/GC)
-            for (int i = 0; i < _distance.Length; i++) _distance[i] = double.PositiveInfinity;
-            for (int i = 0; i < _parentIdx.Length; i++) _parentIdx[i] = -1;
-
-            _distance[srcIdx] = 0.0;
-
-            MinHeap pq = new MinHeap(capacity: Math.Min(_n, 1 << 20));
-            pq.Insert(srcIdx, 0.0);
-
-            while (pq.Count > 0)
+            // Build / move window if needed
+            if (!_winValid || !IsInsideWindow(targetX, targetY) || !IsInsideWindow(_anchorX, _anchorY))
             {
-                int u = pq.ExtractMin(out double du);
+                int newLeft, newTop;
+                ComputeWindowTopLeft(targetX, targetY, out newLeft, out newTop);
 
-                // Stale entry (we already found a better distance)
-                if (du > _distance[u])
+                bool windowChanged = (!_winValid) || (newLeft != _winLeft) || (newTop != _winTop);
+
+                if (windowChanged)
+                {
+                    SetWindow(newLeft, newTop);
+                    _dijkstraValid = false;
+                }
+            }
+
+            // Clamp target into window
+            int effX = targetX;
+            int effY = targetY;
+
+            if (effX < _winLeft) effX = _winLeft;
+            if (effX > _winRight) effX = _winRight;
+            if (effY < _winTop) effY = _winTop;
+            if (effY > _winBottom) effY = _winBottom;
+
+            // Ensure anchor is inside (should be by construction)
+            if (!IsInsideWindow(_anchorX, _anchorY))
+            {
+                // As a fallback, re-center around anchor.
+                int newLeft2, newTop2;
+                ComputeWindowTopLeft(_anchorX, _anchorY, out newLeft2, out newTop2);
+                SetWindow(newLeft2, newTop2);
+                _dijkstraValid = false;
+
+                if (effX < _winLeft) effX = _winLeft;
+                if (effX > _winRight) effX = _winRight;
+                if (effY < _winTop) effY = _winTop;
+                if (effY > _winBottom) effY = _winBottom;
+            }
+
+            // Compute Dijkstra for this window if needed
+            if (!_dijkstraValid)
+            {
+                RunDijkstraWindow();
+                _dijkstraValid = true;
+            }
+
+            return new Point(effX, effY);
+        }
+
+        private bool IsInsideWindow(int x, int y)
+        {
+            if (!_winValid) return false;
+            return x >= _winLeft && x <= _winRight && y >= _winTop && y <= _winBottom;
+        }
+
+        private void ComputeWindowTopLeft(int cursorX, int cursorY, out int left, out int top)
+        {
+            // Start centered around cursor
+            left = cursorX - _halfWindow;
+            top = cursorY - _halfWindow;
+
+            // Clamp to image so window fits
+            int maxLeft = _width - _windowSize;
+            int maxTop = _height - _windowSize;
+            if (maxLeft < 0) maxLeft = 0;
+            if (maxTop < 0) maxTop = 0;
+
+            if (left < 0) left = 0;
+            if (top < 0) top = 0;
+            if (left > maxLeft) left = maxLeft;
+            if (top > maxTop) top = maxTop;
+
+            // Shift to keep anchor inside (if possible)
+            // If the cursor is too far, the cursor will be clamped later.
+            if (_hasAnchor)
+            {
+                if (_anchorX < left) left = _anchorX;
+                if (_anchorX > left + _windowSize - 1) left = _anchorX - _windowSize + 1;
+
+                if (_anchorY < top) top = _anchorY;
+                if (_anchorY > top + _windowSize - 1) top = _anchorY - _windowSize + 1;
+
+                if (left < 0) left = 0;
+                if (top < 0) top = 0;
+                if (left > maxLeft) left = maxLeft;
+                if (top > maxTop) top = maxTop;
+            }
+        }
+
+        private void SetWindow(int left, int top)
+        {
+            _winLeft = left;
+            _winTop = top;
+
+            _winRight = _winLeft + _windowSize - 1;
+            _winBottom = _winTop + _windowSize - 1;
+
+            if (_winRight >= _width) _winRight = _width - 1;
+            if (_winBottom >= _height) _winBottom = _height - 1;
+
+            _winWidth = _winRight - _winLeft + 1;
+            _winHeight = _winBottom - _winTop + 1;
+            _winN = _winWidth * _winHeight;
+
+            EnsureWindowBuffers(_winN);
+
+            // Update anchor local index
+            _anchorIdxLocal = GlobalToLocal(_anchorX, _anchorY);
+
+            _winValid = true;
+        }
+
+        private void EnsureWindowBuffers(int winN)
+        {
+            if (_dist == null || _dist.Length != winN) _dist = new double[winN];
+            if (_parent == null || _parent.Length != winN) _parent = new int[winN];
+
+            // Ensure heap can handle winN items (it can grow automatically)
+            if (_pq == null) _pq = new MinHeap(Math.Max(1024, winN));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int GlobalToLocal(int x, int y)
+        {
+            return (y - _winTop) * _winWidth + (x - _winLeft);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void LocalToGlobal(int localIdx, out int x, out int y)
+        {
+            int row = localIdx / _winWidth;
+            int col = localIdx - row * _winWidth;
+            x = _winLeft + col;
+            y = _winTop + row;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int LocalToGlobalIdx(int localIdx)
+        {
+            int row = localIdx / _winWidth;
+            int col = localIdx - row * _winWidth;
+            int gy = _winTop + row;
+            int gx = _winLeft + col;
+            return gy * _width + gx;
+        }
+
+        /// <summary>
+        /// Dijkstra within the current window only.
+        /// Source = anchor (must be inside window).
+        /// </summary>
+        private void RunDijkstraWindow()
+        {
+            if (!_winValid) return;
+
+            Stopwatch sw = null;
+            if (LOG_TIMINGS) sw = Stopwatch.StartNew();
+
+            for (int i = 0; i < _winN; i++)
+            {
+                _dist[i] = double.PositiveInfinity;
+                _parent[i] = -1;
+            }
+
+            _pq.Clear();
+
+            // Anchor must be inside window; if not, just bail
+            if (_anchorIdxLocal < 0 || _anchorIdxLocal >= _winN)
+                return;
+
+            _dist[_anchorIdxLocal] = 0.0;
+            _pq.Insert(_anchorIdxLocal, 0.0);
+
+            while (_pq.Count > 0)
+            {
+                double du;
+                int uLocal = _pq.ExtractMin(out du);
+
+                if (du > _dist[uLocal])
                     continue;
 
-                int row = Math.DivRem(u, _width, out int col);
+                int uRow = uLocal / _winWidth;
+                int uCol = uLocal - uRow * _winWidth;
 
-                // Right neighbor: (row, col+1)
-                if (col + 1 < _width)
+                int uGlobalIdx = LocalToGlobalIdx(uLocal);
+
+                // Right
+                if (uCol + 1 < _winWidth)
                 {
-                    int v = u + 1;
-                    double nd = du + _weightRight[u];
-                    if (nd < _distance[v])
+                    int vLocal = uLocal + 1;
+                    double nd = du + _weightRight[uGlobalIdx];
+                    if (nd < _dist[vLocal])
                     {
-                        _distance[v] = nd;
-                        _parentIdx[v] = u;
-                        pq.Insert(v, nd);
+                        _dist[vLocal] = nd;
+                        _parent[vLocal] = uLocal;
+                        _pq.Insert(vLocal, nd);
                     }
                 }
 
-                // Left neighbor: (row, col-1) uses weightRight[u-1]
-                if (col > 0)
+                // Left
+                if (uCol > 0)
                 {
-                    int v = u - 1;
-                    double nd = du + _weightRight[v]; // v == u-1
-                    if (nd < _distance[v])
+                    int vLocal = uLocal - 1;
+                    int vGlobalIdx = uGlobalIdx - 1;
+                    double nd = du + _weightRight[vGlobalIdx];
+                    if (nd < _dist[vLocal])
                     {
-                        _distance[v] = nd;
-                        _parentIdx[v] = u;
-                        pq.Insert(v, nd);
+                        _dist[vLocal] = nd;
+                        _parent[vLocal] = uLocal;
+                        _pq.Insert(vLocal, nd);
                     }
                 }
 
-                // Down neighbor: (row+1, col)
-                if (row + 1 < _height)
+                // Down
+                if (uRow + 1 < _winHeight)
                 {
-                    int v = u + _width;
-                    double nd = du + _weightDown[u];
-                    if (nd < _distance[v])
+                    int vLocal = uLocal + _winWidth;
+                    double nd = du + _weightDown[uGlobalIdx];
+                    if (nd < _dist[vLocal])
                     {
-                        _distance[v] = nd;
-                        _parentIdx[v] = u;
-                        pq.Insert(v, nd);
+                        _dist[vLocal] = nd;
+                        _parent[vLocal] = uLocal;
+                        _pq.Insert(vLocal, nd);
                     }
                 }
 
-                // Up neighbor: (row-1, col) uses weightDown[u-width]
-                if (row > 0)
+                // Up
+                if (uRow > 0)
                 {
-                    int v = u - _width;
-                    double nd = du + _weightDown[v]; // v == u-width
-                    if (nd < _distance[v])
+                    int vLocal = uLocal - _winWidth;
+                    int vGlobalIdx = uGlobalIdx - _width;
+                    double nd = du + _weightDown[vGlobalIdx];
+                    if (nd < _dist[vLocal])
                     {
-                        _distance[v] = nd;
-                        _parentIdx[v] = u;
-                        pq.Insert(v, nd);
+                        _dist[vLocal] = nd;
+                        _parent[vLocal] = uLocal;
+                        _pq.Insert(vLocal, nd);
                     }
                 }
             }
 
-            sw.Stop();
-
-
-            Console.WriteLine($"Dijkstra: {sw.ElapsedMilliseconds} ms");
+            if (LOG_TIMINGS)
+            {
+                sw.Stop();
+                Console.WriteLine("Window Dijkstra (" + _winWidth + "x" + _winHeight + "): " + sw.ElapsedMilliseconds + " ms");
+            }
         }
 
         /// <summary>
-        /// Backtrack shortest path from free point to anchor point.
-        /// Returns points from free -> anchor (same as your original behavior).
+        /// Backtrack path from effective target to anchor (within current window).
+        /// Returns points from target -> anchor (same behavior as before).
         /// </summary>
-        public List<Point> GetPathToAnchor(int freeX, int freeY)
+        public List<Point> GetPathToAnchor(int targetX, int targetY, out Point effectiveTarget)
         {
+            effectiveTarget = PrepareForTarget(targetX, targetY);
+
             List<Point> path = new List<Point>(256);
 
-            if (!_hasAnchor || _imageMatrix == null)
+            if (!_hasAnchor || !_winValid)
                 return path;
 
-            if ((uint)freeX >= (uint)_width || (uint)freeY >= (uint)_height)
+            int effX = effectiveTarget.X;
+            int effY = effectiveTarget.Y;
+
+            if (!IsInsideWindow(effX, effY))
                 return path;
 
-            int cur = freeY * _width + freeX;
-            int anchor = _anchorIdx;
+            int curLocal = GlobalToLocal(effX, effY);
+            int anchorLocal = _anchorIdxLocal;
 
-            while (cur != -1)
+            // If anchor local invalid, return empty
+            if (anchorLocal < 0 || anchorLocal >= _winN)
+                return path;
+
+            while (curLocal != -1)
             {
-                path.Add(IdxToPoint(cur));
-                if (cur == anchor)
+                int gx, gy;
+                LocalToGlobal(curLocal, out gx, out gy);
+                path.Add(new Point(gx, gy));
+
+                if (curLocal == anchorLocal)
                     break;
 
-                cur = _parentIdx[cur];
+                curLocal = _parent[curLocal];
             }
 
             return path;
         }
 
         /// <summary>
-        /// Fast drawing: backtracks and draws segments without allocating a List (best for live mouse-move).
+        /// Fast drawing: draws the path from the (possibly clamped) target to anchor without allocating lists.
         /// </summary>
-        public void DrawPath(Graphics g, int freeX, int freeY, Color pathColor, int thickness = 2)
+        public void DrawPath(Graphics g, int targetX, int targetY, Color pathColor, int thickness)
         {
             if (!_hasAnchor || _imageMatrix == null)
                 return;
 
-            if ((uint)freeX >= (uint)_width || (uint)freeY >= (uint)_height)
+            Point eff = PrepareForTarget(targetX, targetY);
+
+            if (!_winValid)
                 return;
 
-            int cur = freeY * _width + freeX;
-            int anchor = _anchorIdx;
+            int effX = eff.X;
+            int effY = eff.Y;
 
-            // Need at least one segment
-            int next = _parentIdx[cur];
-            if (next == -1 || cur == anchor)
+            if (!IsInsideWindow(effX, effY))
+                return;
+
+            int curLocal = GlobalToLocal(effX, effY);
+            int anchorLocal = _anchorIdxLocal;
+
+            int nextLocal = _parent[curLocal];
+            if (nextLocal == -1 || curLocal == anchorLocal)
                 return;
 
             using (Pen pen = new Pen(pathColor, thickness))
             {
-                while (cur != -1 && next != -1)
+                while (curLocal != -1 && nextLocal != -1)
                 {
-                    Point p1 = IdxToPoint(cur);
-                    Point p2 = IdxToPoint(next);
-                    g.DrawLine(pen, p1, p2);
+                    int x1, y1, x2, y2;
+                    LocalToGlobal(curLocal, out x1, out y1);
+                    LocalToGlobal(nextLocal, out x2, out y2);
 
-                    if (next == anchor)
+                    g.DrawLine(pen, x1, y1, x2, y2);
+
+                    if (nextLocal == anchorLocal)
                         break;
 
-                    cur = next;
-                    next = _parentIdx[cur];
+                    curLocal = nextLocal;
+                    nextLocal = _parent[curLocal];
                 }
             }
-        }
-
-        public void DrawAnchorPoint(Graphics g, Color color, int size = 6)
-        {
-            if (!_hasAnchor)
-                return;
-
-            Point a = IdxToPoint(_anchorIdx);
-            using (SolidBrush brush = new SolidBrush(color))
-            {
-                g.FillEllipse(brush, a.X - size / 2, a.Y - size / 2, size, size);
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private Point IdxToPoint(int idx)
-        {
-            int y = Math.DivRem(idx, _width, out int x);
-            return new Point(x, y);
         }
     }
 
     /// <summary>
     /// Manages multiple anchor points for creating closed selections.
-    /// Optimizations:
-    /// - Store confirmed paths as Point[] and draw with Graphics.DrawLines (1 call per path).
-    /// - Live path drawing uses ShortestPathFinder.DrawPath() (no allocations per frame).
+    /// Uses window stepping on clicks when the click is far (repeated 128x128 window solves).
     /// </summary>
     public sealed class MultiAnchorPathFinder
     {
         private RGBPixel[,] _imageMatrix;
         private readonly ShortestPathFinder _pathFinder;
-        private readonly List<Point> _anchorPoints;
-        private readonly List<Point[]> _confirmedPaths;
+
+        private readonly List<Point> _anchorPoints;      // explicit anchors (clicks)
+        private readonly List<Point[]> _confirmedPaths;  // segments (each in forward order)
+
         private bool _isClosed;
 
         public MultiAnchorPathFinder()
         {
-            _pathFinder = new ShortestPathFinder();
+            _pathFinder = new ShortestPathFinder(128); // change this if you want a different window size
             _anchorPoints = new List<Point>();
             _confirmedPaths = new List<Point[]>();
             _isClosed = false;
@@ -417,24 +642,67 @@ namespace MagniSnap
 
         public void AddAnchorPoint(int x, int y)
         {
-            // If there's a previous anchor, save the path to this new point
-            if (_anchorPoints.Count > 0)
+            if (_imageMatrix == null)
+                return;
+
+            if (_isClosed)
+                return;
+
+            // First anchor
+            if (_anchorPoints.Count == 0)
             {
-                List<Point> path = _pathFinder.GetPathToAnchor(x, y);
-                if (path.Count >= 2)
-                    _confirmedPaths.Add(path.ToArray());
+                _anchorPoints.Add(new Point(x, y));
+                _pathFinder.SetAnchorPoint(x, y);
+                return;
             }
 
+            // Walk in window-sized steps until we reach (x,y)
+            CommitPathInSteps(x, y);
+
+            // Register explicit anchor at the actual click location
             _anchorPoints.Add(new Point(x, y));
             _pathFinder.SetAnchorPoint(x, y);
         }
 
         /// <summary>
-        /// If you still need the points (allocates). Prefer Draw() for live usage.
+        /// Prepare for drawing (returns the effective point actually used for live drawing; may be clamped).
         /// </summary>
-        public List<Point> GetLivePath(int freeX, int freeY)
+        public Point UpdateCursor(int x, int y)
         {
-            return _pathFinder.GetPathToAnchor(freeX, freeY);
+            if (!HasAnchors || _isClosed)
+                return new Point(x, y);
+
+            return _pathFinder.PrepareForTarget(x, y);
+        }
+
+        private void CommitPathInSteps(int targetX, int targetY)
+        {
+            // Safety: avoid infinite loops if something goes wrong
+            const int MAX_STEPS = 2048;
+            int steps = 0;
+
+            while (steps++ < MAX_STEPS)
+            {
+                Point effective;
+                List<Point> freeToAnchor = _pathFinder.GetPathToAnchor(targetX, targetY, out effective);
+
+                if (freeToAnchor == null || freeToAnchor.Count < 2)
+                    break;
+
+                // Convert to forward segment: anchor -> effective
+                freeToAnchor.Reverse();
+
+                // Avoid adding degenerate segments
+                if (freeToAnchor.Count >= 2)
+                    _confirmedPaths.Add(freeToAnchor.ToArray());
+
+                // If we reached the real target, done
+                if (effective.X == targetX && effective.Y == targetY)
+                    break;
+
+                // Otherwise, we only reached a clamped "edge" point: make it the new implicit anchor and continue
+                _pathFinder.SetAnchorPoint(effective.X, effective.Y);
+            }
         }
 
         public void CloseSelection()
@@ -443,17 +711,16 @@ namespace MagniSnap
                 return;
 
             Point first = _anchorPoints[0];
-            List<Point> closingPath = _pathFinder.GetPathToAnchor(first.X, first.Y);
-            if (closingPath.Count >= 2)
-            { 
-                _confirmedPaths.Add(closingPath.ToArray());
-                _isClosed = true;
-            }
+
+            // Connect current anchor to the first anchor using window steps
+            CommitPathInSteps(first.X, first.Y);
+
+            _isClosed = true;
         }
 
         public void Draw(Graphics g, int freeX, int freeY, Color pathColor, Color anchorColor)
         {
-            // Draw confirmed paths (single GDI+ call per path)
+            // Draw confirmed paths
             using (Pen pen = new Pen(pathColor, 2))
             {
                 for (int i = 0; i < _confirmedPaths.Count; i++)
@@ -464,10 +731,10 @@ namespace MagniSnap
                 }
             }
 
-            // Draw live path WITHOUT allocations
+            // Draw live path (windowed; may clamp the cursor internally)
             _pathFinder.DrawPath(g, freeX, freeY, pathColor, 2);
 
-            // Draw anchor points
+            // Draw explicit anchor points
             using (SolidBrush brush = new SolidBrush(anchorColor))
             {
                 for (int i = 0; i < _anchorPoints.Count; i++)
@@ -482,12 +749,15 @@ namespace MagniSnap
         {
             _anchorPoints.Clear();
             _confirmedPaths.Clear();
+            _isClosed = false;
+
+            _pathFinder.ClearAnchor();
         }
 
-        public int AnchorCount => _anchorPoints.Count;
-        public bool HasAnchors => _anchorPoints.Count > 0;
+        public int AnchorCount { get { return _anchorPoints.Count; } }
+        public bool HasAnchors { get { return _anchorPoints.Count > 0; } }
 
-        public bool IsClosed => _isClosed;
+        public bool IsClosed { get { return _isClosed; } }
 
         public Point[] GetClosedPolygon()
         {

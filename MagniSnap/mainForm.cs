@@ -12,18 +12,27 @@ namespace MagniSnap
     {
         RGBPixel[,] ImageMatrix;
         bool isLassoActive = false;   // tool accepts input & live paths
-        bool isLassoVisible = false; // selection is drawn
+        bool isLassoVisible = false;  // selection is drawn
 
-        // Shortest path finder for livewire
+        // Livewire (windowed)
         MultiAnchorPathFinder pathFinder;
+
+        // Raw mouse position (for UI)
         Point currentMousePos;
+
+        // Effective draw position (may be clamped to the current window)
+        Point liveDrawPos;
 
         public MainForm()
         {
             InitializeComponent();
             indicator_pnl.Hide();
+
+            // Window size is configured inside ShortestPathFinder (default 128x128)
             pathFinder = new MultiAnchorPathFinder();
+
             currentMousePos = new Point(0, 0);
+            liveDrawPos = new Point(0, 0);
 
             // Enable double buffering to reduce flicker
             mainPictureBox.GetType().GetProperty("DoubleBuffered",
@@ -63,7 +72,7 @@ namespace MagniSnap
             OpenFileDialog openFileDialog1 = new OpenFileDialog();
             if (openFileDialog1.ShowDialog() == DialogResult.OK)
             {
-                //Open the browsed image and display it
+                // Open the browsed image and display it
                 string OpenedFilePath = openFileDialog1.FileName;
                 ImageMatrix = ImageToolkit.OpenImage(OpenedFilePath);
                 ImageToolkit.ViewImage(ImageMatrix, mainPictureBox);
@@ -75,6 +84,9 @@ namespace MagniSnap
 
                 // Initialize path finder with the image
                 pathFinder.SetImage(ImageMatrix);
+
+                liveDrawPos = new Point(0, 0);
+                mainPictureBox.Refresh();
             }
         }
 
@@ -83,6 +95,8 @@ namespace MagniSnap
             // Clear the livewire paths
             if (ImageMatrix != null)
                 pathFinder.SetImage(ImageMatrix);
+
+            liveDrawPos = currentMousePos;
             mainPictureBox.Refresh();
         }
 
@@ -119,16 +133,20 @@ namespace MagniSnap
 
             if (e.Button == MouseButtons.Left)
             {
-                // Add anchor point and run Dijkstra
+                // Add anchor point (may internally "walk" in window-steps if far)
                 pathFinder.AddAnchorPoint(e.X, e.Y);
+
+                // Update live draw pos
+                liveDrawPos = pathFinder.UpdateCursor(e.X, e.Y);
+
                 mainPictureBox.Refresh();
             }
             else if (e.Button == MouseButtons.Right)
             {
                 // Close selection (connect last anchor to first)
                 pathFinder.CloseSelection();
-                // Exit lasso tool
-                // Stop live interaction but keep drawing
+
+                // Exit lasso tool: stop live interaction but keep drawing
                 isLassoActive = false;
                 mainPictureBox.Cursor = Cursors.Default;
 
@@ -145,8 +163,13 @@ namespace MagniSnap
 
             if (ImageMatrix != null && isLassoActive && pathFinder.HasAnchors)
             {
-                // Refresh to redraw the live path
+                // Prepare / clamp cursor for the current window and redraw
+                liveDrawPos = pathFinder.UpdateCursor(e.X, e.Y);
                 mainPictureBox.Invalidate();
+            }
+            else
+            {
+                liveDrawPos = currentMousePos;
             }
         }
 
@@ -163,7 +186,7 @@ namespace MagniSnap
                 return;
 
             // Draw all paths (confirmed + live)
-            pathFinder.Draw(e.Graphics, currentMousePos.X, currentMousePos.Y,
+            pathFinder.Draw(e.Graphics, liveDrawPos.X, liveDrawPos.Y,
                 Color.Lime, Color.Red);
         }
 
@@ -186,17 +209,13 @@ namespace MagniSnap
             if (polygon == null || polygon.Length < 3)
                 return;
 
-            SaveFileDialog sfd = new SaveFileDialog
-            {
-                Filter = "PNG Image (*.png)|*.png",
-                DefaultExt = "png",
-                FileName = $"selection_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.png"
-            };
+            SaveFileDialog sfd = new SaveFileDialog();
+            sfd.Filter = "PNG Image (*.png)|*.png";
+            sfd.DefaultExt = "png";
+            sfd.FileName = string.Format("selection_{0:yyyy-MM-dd_HH-mm-ss}.png", DateTime.Now);
 
             if (sfd.ShowDialog() != DialogResult.OK)
                 return;
-
-   
 
             // Compute bounding box
             Rectangle bounds = GetPolygonBounds(polygon);
