@@ -1,464 +1,485 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
+using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
 
 namespace MagniSnap
 {
     /// <summary>
-    /// Node in the priority queue for Dijkstra's algorithm
+    /// Fast min-heap for (nodeIndex, priority) pairs.
+    /// No structs/IComparable, no swaps: sift-up/down with "hole" technique.
     /// </summary>
-    public struct PQNode : IComparable<PQNode>
+    internal sealed class MinHeap
     {
-        public int Row;
-        public int Col;
-        public double Distance;
+        private int[] _node;
+        private double[] _prio;
+        private int _count;
 
-        public PQNode(int row, int col, double distance)
+        public MinHeap(int capacity = 1024)
         {
-            Row = row;
-            Col = col;
-            Distance = distance;
+            if (capacity < 1) capacity = 1;
+            _node = new int[capacity];
+            _prio = new double[capacity];
+            _count = 0;
         }
 
-        public int CompareTo(PQNode other)
+        public int Count => _count;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Clear() => _count = 0;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Insert(int nodeIndex, double priority)
         {
-            return Distance.CompareTo(other.Distance);
+            if (_count == _node.Length) Grow();
+
+            int i = _count++;
+            SiftUp(i, nodeIndex, priority);
+        }
+
+        public int ExtractMin(out double priority)
+        {
+            if (_count == 0) throw new InvalidOperationException("Heap is empty");
+
+            int minNode = _node[0];
+            double minPrio = _prio[0];
+
+            _count--;
+            if (_count > 0)
+            {
+                int lastNode = _node[_count];
+                double lastPrio = _prio[_count];
+                SiftDown(0, lastNode, lastPrio);
+            }
+
+            priority = minPrio;
+            return minNode;
+        }
+
+        private void Grow()
+        {
+            int newCap = _node.Length * 2;
+            Array.Resize(ref _node, newCap);
+            Array.Resize(ref _prio, newCap);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SiftUp(int i, int nodeIndex, double priority)
+        {
+            while (i > 0)
+            {
+                int parent = (i - 1) >> 1;
+                if (priority >= _prio[parent]) break;
+
+                _node[i] = _node[parent];
+                _prio[i] = _prio[parent];
+                i = parent;
+            }
+
+            _node[i] = nodeIndex;
+            _prio[i] = priority;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SiftDown(int i, int nodeIndex, double priority)
+        {
+            int half = _count >> 1; // nodes with at least one child
+            while (i < half)
+            {
+                int left = (i << 1) + 1;
+                int right = left + 1;
+
+                int child = left;
+                double childPrio = _prio[left];
+
+                if (right < _count && _prio[right] < childPrio)
+                {
+                    child = right;
+                    childPrio = _prio[right];
+                }
+
+                if (childPrio >= priority) break;
+
+                _node[i] = _node[child];
+                _prio[i] = childPrio;
+                i = child;
+            }
+
+            _node[i] = nodeIndex;
+            _prio[i] = priority;
         }
     }
 
     /// <summary>
-    /// Min-Heap priority queue for Dijkstra's algorithm
-    /// Time: O(log n) for insert and extract-min
+    /// Finds shortest path using Dijkstra on a 4-connected pixel grid.
+    /// Major optimizations:
+    /// - Flattened 2D arrays into 1D for cache efficiency
+    /// - Removed GetEdgeWeight() swapping/branching from inner loop
+    /// - Reuse arrays between runs to avoid large allocations/GC pressure
+    /// - Fast heap + stale-entry skip (no visited[,] needed)
+    /// - DrawPath() backtracks and draws without allocating a List every mouse-move
     /// </summary>
-    public class MinHeap
+    public sealed class ShortestPathFinder
     {
-        private List<PQNode> heap;
+        private RGBPixel[,] _imageMatrix;
+        private int _height;
+        private int _width;
+        private int _n; // _height * _width
 
-        public MinHeap()
-        {
-            heap = new List<PQNode>();
-        }
+        // Edge weights stored per pixel (flattened):
+        // weightRight[idx] = weight from (r,c) to (r,c+1)
+        // weightDown[idx]  = weight from (r,c) to (r+1,c)
+        private float[] _weightRight;
+        private float[] _weightDown;
 
-        public int Count => heap.Count;
+        // Dijkstra results (flattened)
+        private double[] _distance;
+        private int[] _parentIdx; // previous node index, -1 if none
 
-        public void Insert(PQNode node)
-        {
-            heap.Add(node);
-            HeapifyUp(heap.Count - 1);
-        }
+        private int _anchorIdx = -1;
+        private bool _hasAnchor;
 
-        public PQNode ExtractMin()
-        {
-            if (heap.Count == 0)
-                throw new InvalidOperationException("Heap is empty");
-
-            PQNode min = heap[0];
-            heap[0] = heap[heap.Count - 1];
-            heap.RemoveAt(heap.Count - 1);
-
-            if (heap.Count > 0)
-                HeapifyDown(0);
-
-            return min;
-        }
-
-        private void HeapifyUp(int index)
-        {
-            while (index > 0)
-            {
-                int parent = (index - 1) / 2;
-                if (heap[index].CompareTo(heap[parent]) >= 0)
-                    break;
-
-                Swap(index, parent);
-                index = parent;
-            }
-        }
-
-        private void HeapifyDown(int index)
-        {
-            while (true)
-            {
-                int smallest = index;
-                int left = 2 * index + 1;
-                int right = 2 * index + 2;
-
-                if (left < heap.Count && heap[left].CompareTo(heap[smallest]) < 0)
-                    smallest = left;
-
-                if (right < heap.Count && heap[right].CompareTo(heap[smallest]) < 0)
-                    smallest = right;
-
-                if (smallest == index)
-                    break;
-
-                Swap(index, smallest);
-                index = smallest;
-            }
-        }
-
-        private void Swap(int i, int j)
-        {
-            PQNode temp = heap[i];
-            heap[i] = heap[j];
-            heap[j] = temp;
-        }
-    }
-
-    /// <summary>
-    /// Finds shortest path using Dijkstra's algorithm on the image graph
-    /// Graph: pixels are vertices, 4-connected edges with weights = 1/G (G = edge energy)
-    /// </summary>
-    public class ShortestPathFinder
-    {
-        private RGBPixel[,] imageMatrix;
-        private int height;
-        private int width;
-
-        // Dijkstra results
-        private double[,] distance;
-        private Point[,] parent;
-        private bool[,] visited;
-
-        // Current anchor point
-        private Point anchorPoint;
-        private bool hasAnchor;
-
-        // 4-connectivity: up, down, left, right
-        private static readonly int[] dRow = { -1, 1, 0, 0 };
-        private static readonly int[] dCol = { 0, 0, -1, 1 };
-
-        // Precomputed edge weights for efficiency
-        private double[,] weightRight;  // Weight to right neighbor (col+1)
-        private double[,] weightDown;   // Weight to bottom neighbor (row+1)
+        public bool HasAnchor => _hasAnchor;
+        public Point AnchorPoint => _hasAnchor ? IdxToPoint(_anchorIdx) : new Point(-1, -1);
 
         public ShortestPathFinder()
         {
-            hasAnchor = false;
+            _hasAnchor = false;
         }
 
-        /// <summary>
-        /// Set the image and precompute edge weights
-        /// Time: O(N²) where N = max(width, height)
-        /// </summary>
         public void SetImage(RGBPixel[,] imageMatrix)
         {
-            this.imageMatrix = imageMatrix;
-            this.height = ImageToolkit.GetHeight(imageMatrix);
-            this.width = ImageToolkit.GetWidth(imageMatrix);
+            _imageMatrix = imageMatrix ?? throw new ArgumentNullException(nameof(imageMatrix));
+            _height = ImageToolkit.GetHeight(imageMatrix);
+            _width = ImageToolkit.GetWidth(imageMatrix);
+            _n = _height * _width;
 
-            // Precompute all edge weights (graph construction)
-            BuildGraph();
+            EnsureWorkingBuffers(_n);
+            BuildGraph(); // precompute edge weights once per image
 
-            hasAnchor = false;
+            _hasAnchor = false;
+            _anchorIdx = -1;
+        }
+
+        private void EnsureWorkingBuffers(int n)
+        {
+            if (_weightRight == null || _weightRight.Length != n) _weightRight = new float[n];
+            if (_weightDown == null || _weightDown.Length != n) _weightDown = new float[n];
+
+            if (_distance == null || _distance.Length != n) _distance = new double[n];
+            if (_parentIdx == null || _parentIdx.Length != n) _parentIdx = new int[n];
         }
 
         /// <summary>
-        /// Build the weighted graph by precomputing edge weights
-        /// Weight = 1/G where G is edge energy (strength)
-        /// Low G (homogeneous) -> high weight, High G (edge) -> low weight
-        /// Time: O(N²)
+        /// Build edge weights (graph construction).
+        /// Weight = 1/(energy + epsilon).
         /// </summary>
         private void BuildGraph()
         {
-            weightRight = new double[height, width];
-            weightDown = new double[height, width];
+            const double epsilon = 0.0001;
 
-            const double epsilon = 0.0001; // Avoid division by zero
+            Stopwatch sw = Stopwatch.StartNew();
 
-            for (int row = 0; row < height; row++)
+         
+            for (int row = 0; row < _height; row++)
             {
-                for (int col = 0; col < width; col++)
+                int baseIdx = row * _width;
+                for (int col = 0; col < _width; col++)
                 {
-                    // Get edge energy: X = right, Y = down
-                    Vector2D energy = ImageToolkit.CalculatePixelEnergies(col, row, imageMatrix);
+                    int idx = baseIdx + col;
+                    Vector2D energy = ImageToolkit.CalculatePixelEnergies(col, row, _imageMatrix);
 
-                    // Weight = 1/G (inverse of energy)
-                    // Higher energy (strong edge) -> lower weight (attractive)
-                    weightRight[row, col] = 1.0 / (energy.X + epsilon);
-                    weightDown[row, col] = 1.0 / (energy.Y + epsilon);
+                    _weightRight[idx] = (float)(1.0 / (energy.X + epsilon));
+                    _weightDown[idx] = (float)(1.0 / (energy.Y + epsilon));
                 }
             }
+            
+
+            sw.Stop();
+
+            Console.WriteLine($"Graph build: {sw.ElapsedMilliseconds} ms");
         }
 
-        /// <summary>
-        /// Get edge weight between two adjacent pixels
-        /// </summary>
-        private double GetEdgeWeight(int row1, int col1, int row2, int col2)
-        {
-            // Ensure (row1,col1) is the smaller one for consistency
-            if (row2 < row1 || col2 < col1)
-            {
-                int tr = row1; row1 = row2; row2 = tr;
-                int tc = col1; col1 = col2; col2 = tc;
-            }
-
-            if (row2 == row1 + 1) // Down edge
-                return weightDown[row1, col1];
-            else // Right edge
-                return weightRight[row1, col1];
-        }
-
-        /// <summary>
-        /// Set anchor point and run Dijkstra from it
-        /// Time: O(E' log V') where E' and V' are visited edges/vertices
-        /// </summary>
         public void SetAnchorPoint(int x, int y)
         {
-            anchorPoint = new Point(x, y);
-            hasAnchor = true;
+            if (_imageMatrix == null) throw new InvalidOperationException("Image is not set.");
 
-            // Run Dijkstra from anchor point
-            RunDijkstra(y, x); // Note: y = row, x = col
+            if ((uint)x >= (uint)_width || (uint)y >= (uint)_height)
+                throw new ArgumentOutOfRangeException("Anchor point out of bounds.");
+
+            _anchorIdx = y * _width + x;
+            _hasAnchor = true;
+
+            RunDijkstra(_anchorIdx);
         }
 
         /// <summary>
-        /// Dijkstra's algorithm using min-heap priority queue
-        /// Computes shortest path from source to all reachable vertices
-        /// Time: O(E log V) where E = O(4*V) = O(V) for 4-connected grid
+        /// Dijkstra from a single source over the whole grid.
+        /// Uses stale-entry skipping (distFromHeap > distance[u]) instead of visited[].
         /// </summary>
-        private void RunDijkstra(int srcRow, int srcCol)
+        private void RunDijkstra(int srcIdx)
         {
-            // Initialize arrays
-            distance = new double[height, width];
-            parent = new Point[height, width];
-            visited = new bool[height, width];
+            Stopwatch sw = Stopwatch.StartNew();
 
-            for (int r = 0; r < height; r++)
-            {
-                for (int c = 0; c < width; c++)
-                {
-                    distance[r, c] = double.MaxValue;
-                    parent[r, c] = new Point(-1, -1);
-                    visited[r, c] = false;
-                }
-            }
+            // Reset arrays (still O(n), but avoids reallocations/GC)
+            for (int i = 0; i < _distance.Length; i++) _distance[i] = double.PositiveInfinity;
+            for (int i = 0; i < _parentIdx.Length; i++) _parentIdx[i] = -1;
 
-            // Min-heap priority queue
-            MinHeap pq = new MinHeap();
+            _distance[srcIdx] = 0.0;
 
-            // Initialize source
-            distance[srcRow, srcCol] = 0;
-            pq.Insert(new PQNode(srcRow, srcCol, 0));
+            MinHeap pq = new MinHeap(capacity: Math.Min(_n, 1 << 20));
+            pq.Insert(srcIdx, 0.0);
 
             while (pq.Count > 0)
             {
-                PQNode current = pq.ExtractMin();
-                int row = current.Row;
-                int col = current.Col;
+                int u = pq.ExtractMin(out double du);
 
-                // Skip if already visited (stale entry)
-                if (visited[row, col])
+                // Stale entry (we already found a better distance)
+                if (du > _distance[u])
                     continue;
 
-                visited[row, col] = true;
+                int row = Math.DivRem(u, _width, out int col);
 
-                // Explore 4 neighbors
-                for (int i = 0; i < 4; i++)
+                // Right neighbor: (row, col+1)
+                if (col + 1 < _width)
                 {
-                    int newRow = row + dRow[i];
-                    int newCol = col + dCol[i];
-
-                    // Check bounds
-                    if (newRow < 0 || newRow >= height || newCol < 0 || newCol >= width)
-                        continue;
-
-                    // Skip if already visited
-                    if (visited[newRow, newCol])
-                        continue;
-
-                    // Calculate new distance
-                    double weight = GetEdgeWeight(row, col, newRow, newCol);
-                    double newDist = distance[row, col] + weight;
-
-                    // Relaxation
-                    if (newDist < distance[newRow, newCol])
+                    int v = u + 1;
+                    double nd = du + _weightRight[u];
+                    if (nd < _distance[v])
                     {
-                        distance[newRow, newCol] = newDist;
-                        parent[newRow, newCol] = new Point(col, row); // Store as (x, y)
-                        pq.Insert(new PQNode(newRow, newCol, newDist));
+                        _distance[v] = nd;
+                        _parentIdx[v] = u;
+                        pq.Insert(v, nd);
+                    }
+                }
+
+                // Left neighbor: (row, col-1) uses weightRight[u-1]
+                if (col > 0)
+                {
+                    int v = u - 1;
+                    double nd = du + _weightRight[v]; // v == u-1
+                    if (nd < _distance[v])
+                    {
+                        _distance[v] = nd;
+                        _parentIdx[v] = u;
+                        pq.Insert(v, nd);
+                    }
+                }
+
+                // Down neighbor: (row+1, col)
+                if (row + 1 < _height)
+                {
+                    int v = u + _width;
+                    double nd = du + _weightDown[u];
+                    if (nd < _distance[v])
+                    {
+                        _distance[v] = nd;
+                        _parentIdx[v] = u;
+                        pq.Insert(v, nd);
+                    }
+                }
+
+                // Up neighbor: (row-1, col) uses weightDown[u-width]
+                if (row > 0)
+                {
+                    int v = u - _width;
+                    double nd = du + _weightDown[v]; // v == u-width
+                    if (nd < _distance[v])
+                    {
+                        _distance[v] = nd;
+                        _parentIdx[v] = u;
+                        pq.Insert(v, nd);
                     }
                 }
             }
+
+            sw.Stop();
+
+
+            Console.WriteLine($"Dijkstra: {sw.ElapsedMilliseconds} ms");
         }
 
         /// <summary>
-        /// Backtrack shortest path from free point to anchor point
-        /// Time: O(N) where N = path length (at most width + height)
+        /// Backtrack shortest path from free point to anchor point.
+        /// Returns points from free -> anchor (same as your original behavior).
         /// </summary>
         public List<Point> GetPathToAnchor(int freeX, int freeY)
         {
-            List<Point> path = new List<Point>();
+            List<Point> path = new List<Point>(256);
 
-            if (!hasAnchor || imageMatrix == null)
+            if (!_hasAnchor || _imageMatrix == null)
                 return path;
 
-            // Bounds check
-            if (freeX < 0 || freeX >= width || freeY < 0 || freeY >= height)
+            if ((uint)freeX >= (uint)_width || (uint)freeY >= (uint)_height)
                 return path;
 
-            // Backtrack from free point to anchor
-            int curRow = freeY;
-            int curCol = freeX;
+            int cur = freeY * _width + freeX;
+            int anchor = _anchorIdx;
 
-            while (curRow != -1 && curCol != -1)
+            while (cur != -1)
             {
-                path.Add(new Point(curCol, curRow));
-
-                // Check if we reached anchor
-                if (curCol == anchorPoint.X && curRow == anchorPoint.Y)
+                path.Add(IdxToPoint(cur));
+                if (cur == anchor)
                     break;
 
-                Point p = parent[curRow, curCol];
-                curCol = p.X;
-                curRow = p.Y;
+                cur = _parentIdx[cur];
             }
 
             return path;
         }
 
         /// <summary>
-        /// Draw the shortest path on a Graphics object
-        /// Time: O(N) where N = path length
+        /// Fast drawing: backtracks and draws segments without allocating a List (best for live mouse-move).
         /// </summary>
         public void DrawPath(Graphics g, int freeX, int freeY, Color pathColor, int thickness = 2)
         {
-            List<Point> path = GetPathToAnchor(freeX, freeY);
+            if (!_hasAnchor || _imageMatrix == null)
+                return;
 
-            if (path.Count < 2)
+            if ((uint)freeX >= (uint)_width || (uint)freeY >= (uint)_height)
+                return;
+
+            int cur = freeY * _width + freeX;
+            int anchor = _anchorIdx;
+
+            // Need at least one segment
+            int next = _parentIdx[cur];
+            if (next == -1 || cur == anchor)
                 return;
 
             using (Pen pen = new Pen(pathColor, thickness))
             {
-                for (int i = 0; i < path.Count - 1; i++)
+                while (cur != -1 && next != -1)
                 {
-                    g.DrawLine(pen, path[i], path[i + 1]);
+                    Point p1 = IdxToPoint(cur);
+                    Point p2 = IdxToPoint(next);
+                    g.DrawLine(pen, p1, p2);
+
+                    if (next == anchor)
+                        break;
+
+                    cur = next;
+                    next = _parentIdx[cur];
                 }
             }
         }
 
-        /// <summary>
-        /// Draw anchor point marker
-        /// </summary>
         public void DrawAnchorPoint(Graphics g, Color color, int size = 6)
         {
-            if (!hasAnchor)
+            if (!_hasAnchor)
                 return;
 
+            Point a = IdxToPoint(_anchorIdx);
             using (SolidBrush brush = new SolidBrush(color))
             {
-                g.FillEllipse(brush, anchorPoint.X - size / 2, anchorPoint.Y - size / 2, size, size);
+                g.FillEllipse(brush, a.X - size / 2, a.Y - size / 2, size, size);
             }
         }
 
-        public bool HasAnchor => hasAnchor;
-        public Point AnchorPoint => anchorPoint;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private Point IdxToPoint(int idx)
+        {
+            int y = Math.DivRem(idx, _width, out int x);
+            return new Point(x, y);
+        }
     }
 
     /// <summary>
-    /// Manages multiple anchor points for creating closed selections
+    /// Manages multiple anchor points for creating closed selections.
+    /// Optimizations:
+    /// - Store confirmed paths as Point[] and draw with Graphics.DrawLines (1 call per path).
+    /// - Live path drawing uses ShortestPathFinder.DrawPath() (no allocations per frame).
     /// </summary>
-    public class MultiAnchorPathFinder
+    public sealed class MultiAnchorPathFinder
     {
-        private RGBPixel[,] imageMatrix;
-        private ShortestPathFinder pathFinder;
-        private List<Point> anchorPoints;
-        private List<List<Point>> confirmedPaths;
+        private RGBPixel[,] _imageMatrix;
+        private readonly ShortestPathFinder _pathFinder;
+        private readonly List<Point> _anchorPoints;
+        private readonly List<Point[]> _confirmedPaths;
 
         public MultiAnchorPathFinder()
         {
-            pathFinder = new ShortestPathFinder();
-            anchorPoints = new List<Point>();
-            confirmedPaths = new List<List<Point>>();
+            _pathFinder = new ShortestPathFinder();
+            _anchorPoints = new List<Point>();
+            _confirmedPaths = new List<Point[]>();
         }
 
         public void SetImage(RGBPixel[,] imageMatrix)
         {
-            this.imageMatrix = imageMatrix;
-            pathFinder.SetImage(imageMatrix);
+            _imageMatrix = imageMatrix;
+            _pathFinder.SetImage(imageMatrix);
             Clear();
         }
 
-        /// <summary>
-        /// Add a new anchor point
-        /// </summary>
         public void AddAnchorPoint(int x, int y)
         {
             // If there's a previous anchor, save the path to this new point
-            if (anchorPoints.Count > 0)
+            if (_anchorPoints.Count > 0)
             {
-                List<Point> path = pathFinder.GetPathToAnchor(x, y);
-                if (path.Count > 0)
-                    confirmedPaths.Add(path);
+                List<Point> path = _pathFinder.GetPathToAnchor(x, y);
+                if (path.Count >= 2)
+                    _confirmedPaths.Add(path.ToArray());
             }
 
-            anchorPoints.Add(new Point(x, y));
-            pathFinder.SetAnchorPoint(x, y);
+            _anchorPoints.Add(new Point(x, y));
+            _pathFinder.SetAnchorPoint(x, y);
         }
 
         /// <summary>
-        /// Get the live path from last anchor to free point
+        /// If you still need the points (allocates). Prefer Draw() for live usage.
         /// </summary>
         public List<Point> GetLivePath(int freeX, int freeY)
         {
-            return pathFinder.GetPathToAnchor(freeX, freeY);
+            return _pathFinder.GetPathToAnchor(freeX, freeY);
         }
 
-        /// <summary>
-        /// Close the selection by connecting last anchor to first
-        /// </summary>
         public void CloseSelection()
         {
-            if (anchorPoints.Count < 2)
+            if (_anchorPoints.Count < 2)
                 return;
 
-            Point first = anchorPoints[0];
-            List<Point> closingPath = pathFinder.GetPathToAnchor(first.X, first.Y);
-            if (closingPath.Count > 0)
-                confirmedPaths.Add(closingPath);
+            Point first = _anchorPoints[0];
+            List<Point> closingPath = _pathFinder.GetPathToAnchor(first.X, first.Y);
+            if (closingPath.Count >= 2)
+                _confirmedPaths.Add(closingPath.ToArray());
         }
 
-        /// <summary>
-        /// Draw all paths and anchor points
-        /// </summary>
         public void Draw(Graphics g, int freeX, int freeY, Color pathColor, Color anchorColor)
         {
-            // Draw confirmed paths
+            // Draw confirmed paths (single GDI+ call per path)
             using (Pen pen = new Pen(pathColor, 2))
             {
-                foreach (var path in confirmedPaths)
+                for (int i = 0; i < _confirmedPaths.Count; i++)
                 {
-                    if (path.Count < 2) continue;
-                    for (int i = 0; i < path.Count - 1; i++)
-                    {
-                        g.DrawLine(pen, path[i], path[i + 1]);
-                    }
+                    Point[] pts = _confirmedPaths[i];
+                    if (pts != null && pts.Length >= 2)
+                        g.DrawLines(pen, pts);
                 }
             }
 
-            // Draw live path
-            pathFinder.DrawPath(g, freeX, freeY, pathColor, 2);
+            // Draw live path WITHOUT allocations
+            _pathFinder.DrawPath(g, freeX, freeY, pathColor, 2);
 
-            // Draw all anchor points
+            // Draw anchor points
             using (SolidBrush brush = new SolidBrush(anchorColor))
             {
-                foreach (var anchor in anchorPoints)
+                for (int i = 0; i < _anchorPoints.Count; i++)
                 {
-                    g.FillEllipse(brush, anchor.X - 4, anchor.Y - 4, 8, 8);
+                    Point a = _anchorPoints[i];
+                    g.FillEllipse(brush, a.X - 4, a.Y - 4, 8, 8);
                 }
             }
         }
 
-        /// <summary>
-        /// Clear all anchors and paths
-        /// </summary>
         public void Clear()
         {
-            anchorPoints.Clear();
-            confirmedPaths.Clear();
+            _anchorPoints.Clear();
+            _confirmedPaths.Clear();
         }
 
-        public int AnchorCount => anchorPoints.Count;
-        public bool HasAnchors => anchorPoints.Count > 0;
+        public int AnchorCount => _anchorPoints.Count;
+        public bool HasAnchors => _anchorPoints.Count > 0;
     }
 }
